@@ -1,0 +1,2 @@
+brokenaxes==0.6.2
+matplotlib==3.10.8
