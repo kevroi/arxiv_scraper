@@ -20,7 +20,8 @@ def fetch_arxiv_papers_batch(search_query, max_results=1000, start=0, search_fie
         search_field: Field to search in:
             'ti' = title only
             'abs' = abstract only
-            'ti+abs' = title OR abstract
+            'ti_or_abs' = title OR abstract (broad - finds papers with phrase in either)
+            'ti_and_abs' = title AND abstract (strict - phrase must be in both)
             'all' = all fields (title, abstract, authors, comments, etc.)
         exact_phrase: If True, search for exact phrase; if False, search for all words
     
@@ -33,13 +34,37 @@ def fetch_arxiv_papers_batch(search_query, max_results=1000, start=0, search_fie
     if exact_phrase:
         search_term = f'"{search_query}"'
     else:
-        search_term = search_query
+        # For non-exact phrase, we need ALL words present (but in any order)
+        # We'll construct AND conditions for each word
+        words = search_query.split()
+        search_term = words  # Keep as list for special handling
     
     # Build the query based on search field
-    if search_field == 'ti+abs':
-        query_string = f'ti:{search_term}+OR+abs:{search_term}'
+    if search_field == 'ti_or_abs':
+        if exact_phrase:
+            query_string = f'ti:{search_term} OR abs:{search_term}'
+        else:
+            # For non-exact: (word1 in ti OR abs) AND (word2 in ti OR abs) AND (word3 in ti OR abs)
+            word_conditions = []
+            for word in search_term:
+                word_conditions.append(f'(ti:{word} OR abs:{word})')
+            query_string = ' AND '.join(word_conditions)
+    elif search_field == 'ti_and_abs':
+        if exact_phrase:
+            query_string = f'ti:{search_term} AND abs:{search_term}'
+        else:
+            # All words must appear in title AND all words must appear in abstract
+            ti_conditions = ' AND '.join([f'ti:{word}' for word in search_term])
+            abs_conditions = ' AND '.join([f'abs:{word}' for word in search_term])
+            query_string = f'({ti_conditions}) AND ({abs_conditions})'
     else:
-        query_string = f'{search_field}:{search_term}'
+        # Single field (ti, abs, or all)
+        if exact_phrase:
+            query_string = f'{search_field}:{search_term}'
+        else:
+            # All words must appear in the specified field
+            word_conditions = [f'{search_field}:{word}' for word in search_term]
+            query_string = ' AND '.join(word_conditions)
     
     query_params = {
         'search_query': query_string,
@@ -50,6 +75,10 @@ def fetch_arxiv_papers_batch(search_query, max_results=1000, start=0, search_fie
     }
     
     url = base_url + urllib.parse.urlencode(query_params)
+    
+    # Debug: print the actual URL being queried (first batch only)
+    if start == 0:
+        print(f"  Query URL: {url}\n")
     
     try:
         with urllib.request.urlopen(url) as response:
@@ -149,12 +178,12 @@ def fetch_arxiv_papers(search_query, max_results=1000, batch_size=1000, search_f
         search_query: Search terms (e.g., "continual reinforcement learning")
         max_results: Total maximum number of results to fetch
         batch_size: Number of results per API request (max ~1000-2000)
-        search_field: Field to search in ('ti', 'abs', 'ti+abs', 'all')
+        search_field: Field to search in ('ti', 'abs', 'ti_or_abs', 'all')
         exact_phrase: If True, search for exact phrase in arXiv
         local_filter: If provided, apply additional local filtering after fetch
     
     Returns:
-        List of paper dictionaries
+        Tuple of (list of paper dictionaries, boolean indicating if we hit max_results)
     """
     print(f"Fetching papers from arXiv...")
     print(f"Search query: '{search_query}'")
@@ -166,6 +195,10 @@ def fetch_arxiv_papers(search_query, max_results=1000, batch_size=1000, search_f
     all_papers = []
     seen_ids = set()  # Track arXiv IDs to detect duplicates
     start = 0
+    hit_max_results = False
+    
+    # For EXACT_PHRASE=False, we'll do local verification to ensure all words are present
+    verify_all_words = not exact_phrase and local_filter is None
     
     while start < max_results:
         # Calculate how many to fetch in this batch
@@ -182,18 +215,37 @@ def fetch_arxiv_papers(search_query, max_results=1000, batch_size=1000, search_f
         # Filter out duplicates (can happen if papers are added during fetching)
         new_papers = []
         duplicates = 0
+        filtered_missing_words = 0
+        
         for paper in papers:
             if paper['arxiv_id'] not in seen_ids:
-                seen_ids.add(paper['arxiv_id'])
-                new_papers.append(paper)
+                # Check if all words are present (for EXACT_PHRASE=False)
+                if verify_all_words:
+                    search_text = f"{paper['title']} {paper['summary']}".lower()
+                    if search_field == 'ti':
+                        search_text = paper['title'].lower()
+                    elif search_field == 'abs':
+                        search_text = paper['summary'].lower()
+                    
+                    words = search_query.lower().split()
+                    if all(word in search_text for word in words):
+                        seen_ids.add(paper['arxiv_id'])
+                        new_papers.append(paper)
+                    else:
+                        filtered_missing_words += 1
+                else:
+                    seen_ids.add(paper['arxiv_id'])
+                    new_papers.append(paper)
             else:
                 duplicates += 1
         
         if duplicates > 0:
             print(f"  Warning: Found {duplicates} duplicate(s) - filtered out")
+        if filtered_missing_words > 0:
+            print(f"  Warning: Filtered {filtered_missing_words} paper(s) missing required words")
         
         all_papers.extend(new_papers)
-        print(f"  Retrieved {len(new_papers)} unique papers (Total so far: {len(all_papers)})")
+        print(f"  Retrieved {len(new_papers)} valid papers (Total so far: {len(all_papers)})")
         
         # If we got fewer papers than requested, we've reached the end
         if len(papers) < current_batch_size:
@@ -202,12 +254,20 @@ def fetch_arxiv_papers(search_query, max_results=1000, batch_size=1000, search_f
         
         start += len(papers)
         
+        # Check if we're about to hit max_results
+        if start >= max_results:
+            hit_max_results = True
+        
         # Be nice to the arXiv API - add a delay between requests
         if start < max_results:
             print("  Waiting 3 seconds before next request...")
             time.sleep(3)
     
     print(f"\nTotal papers fetched from arXiv: {len(all_papers)}")
+    if hit_max_results:
+        print(f"Note: Hit MAX_RESULTS limit ({max_results}). There may be more papers available.")
+    else:
+        print("Note: Fetched all available papers matching the query.")
     
     # Apply local filtering if specified
     if local_filter:
@@ -215,7 +275,7 @@ def fetch_arxiv_papers(search_query, max_results=1000, batch_size=1000, search_f
         all_papers = filter_papers_locally(all_papers, local_filter, exact_phrase=True)
         print(f"Papers after local filtering: {len(all_papers)}")
     
-    return all_papers
+    return all_papers, hit_max_results
 
 def analyze_papers(papers):
     """Analyze papers and generate statistics."""
@@ -325,8 +385,22 @@ def print_summary(data):
         growth = ((curr_count - prev_count) / prev_count) * 100
         print(f"  {curr_year}: {growth:+.1f}%")
 
-def plot_publications(data, filename_prefix='crl_publications', output_dir='results'):
+def plot_publications(data, filename_prefix='crl_publications', output_dir='results', 
+                     drop_earliest=True):
     """Create a bar chart of publications over time."""
+    
+    
+    # Set plots to match ICML text
+    plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "STIXGeneral"],
+    "mathtext.fontset": "stix",         # matches Times-like math
+    "axes.titlesize": 12,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 8
+    })
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -334,26 +408,26 @@ def plot_publications(data, filename_prefix='crl_publications', output_dir='resu
     years = sorted(data['year_counts'].keys())
     counts = [data['year_counts'][year] for year in years]
     
-    # Remove the earliest year (likely incomplete data)
-    if len(years) > 1:
+    # Remove the earliest year (likely incomplete data) only if requested
+    if drop_earliest and len(years) > 1:
         earliest_year = years[0]
         earliest_count = counts[0]
         print(f"\nNote: Removing earliest year ({earliest_year}) from plot (had {earliest_count} papers)")
         print(f"      This year likely has incomplete data from the search.")
         years = years[1:]
         counts = counts[1:]
+    elif not drop_earliest:
+        print(f"\nNote: Keeping earliest year in plot (fetched all available papers)")
     
     # Create figure with higher DPI for publication quality
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=300)
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=300)
     
     # Create the bar chart
     ax.bar(years, counts, color='#2563eb', edgecolor='none')
     
     # Customize the plot
-    ax.set_xlabel('Year', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Number of Publications', fontsize=14, fontweight='bold')
-    ax.set_title('Continual Reinforcement Learning Publications on arXiv', 
-                 fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Paper Count')
     
     # No gridlines
     ax.grid(False)
@@ -394,16 +468,17 @@ def main():
     OUTPUT_DIR = 'results'  # Directory to save all output files
     
     # Search field options:
-    # 'ti' = title only (most strict)
-    # 'abs' = abstract only
-    # 'ti+abs' = title OR abstract (recommended for CRL)
+    # 'ti' = title only (most strict - only papers with phrase in title)
+    # 'abs' = abstract only (papers with phrase in abstract)
+    # 'ti_or_abs' = title OR abstract (broad - phrase in either title or abstract)
+    # 'ti_and_abs' = title AND abstract (very strict - phrase must be in BOTH)
     # 'all' = all fields (broadest, includes everything)
-    SEARCH_FIELD = 'ti+abs'
-    
+    SEARCH_FIELD = 'ti_or_abs'
+
     # Exact phrase matching:
     # True = search for exact phrase "continual reinforcement learning"
     # False = search for papers containing all words (in any order)
-    EXACT_PHRASE = True
+    EXACT_PHRASE = False
     
     # Local filtering (optional):
     # If you want to fetch broadly then filter locally, set this
@@ -424,13 +499,18 @@ def main():
     print()
     
     print("CONFIGURATION OPTIONS:")
-    print("  SEARCH_FIELD: 'ti' (title), 'abs' (abstract), 'ti+abs', 'all'")
+    print("  SEARCH_FIELD:")
+    print("    'ti' = title only (strictest, recommended)")
+    print("    'abs' = abstract only")
+    print("    'ti_or_abs' = title OR abstract (broader)")
+    print("    'ti_and_abs' = title AND abstract (very strict)")
+    print("    'all' = all fields (broadest)")
     print("  EXACT_PHRASE: True (exact phrase), False (all words)")
     print("  LOCAL_FILTER: Apply additional filtering after fetching")
     print()
     
     # Fetch papers
-    papers = fetch_arxiv_papers(SEARCH_QUERY, MAX_RESULTS, BATCH_SIZE, SEARCH_FIELD, 
+    papers, hit_max_results = fetch_arxiv_papers(SEARCH_QUERY, MAX_RESULTS, BATCH_SIZE, SEARCH_FIELD, 
                                 EXACT_PHRASE, LOCAL_FILTER)
     
     if not papers:
@@ -454,12 +534,15 @@ def main():
     print("\n" + "="*60)
     print("CREATING PLOT")
     print("="*60)
-    plot_publications(data, output_dir=OUTPUT_DIR)
+    # Only drop earliest year if we hit the max_results limit (incomplete data)
+    plot_publications(data, output_dir=OUTPUT_DIR, drop_earliest=hit_max_results)
     
     print("\n" + "="*60)
     print("DONE!")
     print("="*60)
     print(f"\nAll files saved to '{OUTPUT_DIR}/' directory")
+    print("You can now use the CSV files and plots in your paper.")
+    print("Consider creating visualizations with matplotlib or seaborn.")
 
 if __name__ == "__main__":
     main()
